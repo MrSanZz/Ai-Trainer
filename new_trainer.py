@@ -9,6 +9,8 @@ import numpy as np
 from collections import Counter, defaultdict
 import nltk
 from nltk.tokenize import word_tokenize
+import torch
+import torch.nn as nn
 
 # Pastikan nltk telah mengunduh resource yang diperlukan
 nltk.download('punkt')
@@ -43,7 +45,39 @@ class NeuralChat:
         self.response_length_factor = response_length_factor
         self.conversation_history = []  # Menyimpan riwayat pesan dalam format string
         self.lock = threading.Lock()
+        ###############################
+        self.word2idx = {'<unk>': 0}
+        self.idx2word = {0: '<unk>'}
+        self.vocab_size = 10000  # Bisa diupdate secara dinamis
+        self.embedding_dim = 128
+        self.embedding_layer = nn.Embedding(self.vocab_size, self.embedding_dim)
+        self.linear_layer = nn.Linear(self.embedding_dim, self.embedding_dim)
+        ###############################
         self.load_model()
+
+    def train_with_embeddings(self, sentence):
+        """
+        Melakukan pemecahan teks, update vocabulary, dan mengubah token menjadi matrix embedding.
+        Juga meneruskan update n-gram model.
+        """
+        tokens = word_tokenize(sentence.lower())
+        if not tokens:
+            return
+
+        for token in tokens:
+            if token not in self.word2idx:
+                idx = len(self.word2idx)
+                self.word2idx[token] = idx
+                self.idx2word[idx] = token
+
+        indices = [self.word2idx.get(token, 0) for token in tokens]
+        indices_tensor = torch.tensor(indices, dtype=torch.long)
+
+        embeddings = self.embedding_layer(indices_tensor)
+        embedding_matrix = embeddings.detach().numpy()
+        linear_output = self.linear_layer(embeddings)
+        self.train(sentence)
+        return embedding_matrix, linear_output
 
     def _serialize_counter(self, counter_obj):
         """Serialisasi Counter ke dict."""
@@ -301,9 +335,6 @@ def handle_interrupt(signal_received, frame, chatbot):
     exit(0)
 
 def load_external_data():
-    """
-    Memuat data eksternal (dataset) dan melatih model.
-    """
     from datasets import load_dataset
     chatbot = NeuralChat()
     signal.signal(signal.SIGINT, lambda s, f: handle_interrupt(s, f, chatbot))
@@ -312,7 +343,8 @@ def load_external_data():
         for idx, row in enumerate(dataset):
             text_data = row.get("text", "")
             if text_data:
-                chatbot.train(text_data)
+                # Gunakan train_with_embeddings untuk update model dan mendapatkan embedding matrix
+                embedding_matrix, linear_output = chatbot.train_with_embeddings(text_data)
             if idx % 1000 == 0 and idx > 0:
                 size_kb = os.path.getsize(chatbot.model_file) / 1024 if os.path.exists(chatbot.model_file) else 0
                 print(f"Processed {idx} records, model size: {size_kb:.2f} KB", end='\r')
