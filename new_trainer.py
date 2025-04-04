@@ -146,18 +146,46 @@ class NeuralChat:
 
     def generate_response(self, prompt_tokens):
         """
-        Menghasilkan respons berdasarkan prompt dengan mempertimbangkan konteks dan riwayat percakapan.
-        Panjang respons akan ditentukan oleh fungsi determine_response_length.
+        Menghasilkan respons dengan mempertimbangkan konteks penuh dari prompt.
+        Alih-alih hanya menggunakan token terakhir, fungsi ini mencoba mencari
+        kecocokan n-gram dengan menggunakan 3, 2, atau 1 token terakhir dari prompt.
         """
         response = []
-        if prompt_tokens:
-            current_token = prompt_tokens[-1]
-        else:
-            current_token = random.choice(list(self.unigram.keys()))
-        response.append(current_token)
 
+        # Coba gunakan n-gram terbesar yang mungkin dari prompt sebagai seed.
+        seed_found = False
+        for n in [3, 2, 1]:
+            if len(prompt_tokens) >= n:
+                seed = tuple(prompt_tokens[-n:])
+                if n == 3 and seed in self.ngram4 and sum(self.ngram4[seed].values()) > 0:
+                    response.extend(list(seed))
+                    next_token = self.top_k_top_p_sampling(self.ngram4[seed])
+                    response.append(next_token)
+                    seed_found = True
+                    break
+                elif n == 2 and seed in self.trigram and sum(self.trigram[seed].values()) > 0:
+                    response.extend(list(seed))
+                    next_token = self.top_k_top_p_sampling(self.trigram[seed])
+                    response.append(next_token)
+                    seed_found = True
+                    break
+                elif n == 1 and seed[0] in self.bigram and sum(self.bigram[seed[0]].values()) > 0:
+                    response.append(seed[0])
+                    next_token = self.top_k_top_p_sampling(self.bigram[seed[0]])
+                    response.append(next_token)
+                    seed_found = True
+                    break
+
+        # Jika tidak ditemukan seed yang sesuai, gunakan token acak dari model.
+        if not seed_found:
+            seed = random.choice(list(self.unigram.keys()))
+            response.append(seed)
+
+        # Tentukan panjang respons yang diinginkan berdasarkan prompt
         desired_length = self.determine_response_length(prompt_tokens)
-        for _ in range(desired_length - 1):  # sudah memiliki 1 token awal
+
+        # Hasilkan token berikutnya dengan menggunakan n-gram yang lebih tinggi bila memungkinkan
+        while len(response) < desired_length:
             next_token = None
             if len(response) >= 3:
                 key4 = tuple(response[-3:])
