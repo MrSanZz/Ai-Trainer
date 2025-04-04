@@ -1,5 +1,4 @@
 nltk
-pytorch
 numpy
 signal
 collections
