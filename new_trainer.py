@@ -341,10 +341,15 @@ def load_external_data():
     try:
         dataset = load_dataset("OpenAssistant/oasst1", split="train")
         for idx, row in enumerate(dataset):
-            text_data = row.get("text", "")
-            if text_data:
-                # Gunakan train_with_embeddings untuk update model dan mendapatkan embedding matrix
-                embedding_matrix, linear_output = chatbot.train_with_embeddings(text_data)
+            try:
+                text_data = row.get("text", "")
+                if text_data:
+                    # Gunakan train_with_embeddings untuk update model dan mendapatkan embedding matrix
+                    embedding_matrix, linear_output = chatbot.train_with_embeddings(text_data)
+            except Exception as inner_e:
+                logging.warning(f"Skipping row {idx} due to error: {inner_e}")
+                continue
+
             if idx % 1000 == 0 and idx > 0:
                 size_kb = os.path.getsize(chatbot.model_file) / 1024 if os.path.exists(chatbot.model_file) else 0
                 print(f"Processed {idx} records, model size: {size_kb:.2f} KB", end='\r')
