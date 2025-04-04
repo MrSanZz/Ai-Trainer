@@ -1,0 +1,5 @@
+nltk
+torch
+numpy
+signal
+collections
