@@ -56,27 +56,35 @@ class NeuralChat:
         self.load_model()
 
     def train_with_embeddings(self, sentence):
-        """
-        Melakukan pemecahan teks, update vocabulary, dan mengubah token menjadi matrix embedding.
-        Juga meneruskan update n-gram model.
-        """
         tokens = word_tokenize(sentence.lower())
         if not tokens:
             return
 
+        # Update vocabulary secara dinamis dengan batas vocab_size
         for token in tokens:
             if token not in self.word2idx:
-                idx = len(self.word2idx)
-                self.word2idx[token] = idx
-                self.idx2word[idx] = token
+                if len(self.word2idx) < self.vocab_size:
+                    idx = len(self.word2idx)
+                    self.word2idx[token] = idx
+                    self.idx2word[idx] = token
+                else:
+                    # Jika sudah melebihi batas, token akan dianggap <unk>
+                    continue
 
+        # Konversi token ke indeks, token yang tidak ada akan mendapat indeks <unk>
         indices = [self.word2idx.get(token, 0) for token in tokens]
         indices_tensor = torch.tensor(indices, dtype=torch.long)
 
+        # Dapatkan embedding dari embedding layer
         embeddings = self.embedding_layer(indices_tensor)
         embedding_matrix = embeddings.detach().numpy()
+
+        # Proses embeddings melalui linear layer
         linear_output = self.linear_layer(embeddings)
+
+        # Lanjutkan update n-gram model menggunakan metode train yang sudah ada
         self.train(sentence)
+
         return embedding_matrix, linear_output
 
     def _serialize_counter(self, counter_obj):
