@@ -15,6 +15,8 @@ from torch.utils.data import DataLoader, Dataset
 from collections import Counter, defaultdict
 from datasets import load_dataset
 
+locker = False
+
 # Pastikan resource NLTK sudah tersedia
 nltk.download('punkt')
 
@@ -179,25 +181,28 @@ class NeuralChat(nn.Module):
 
     # --- Save / Load & Reprocess ---
     def safe_save(self):
-        with self.lock:
-            data = {
-                "unigram": self._serialize_counter(self.unigram),
-                "bigram": {k: self._serialize_counter(v) for k, v in self.bigram.items()},
-                "trigram": self._serialize_ngram(self.trigram),
-                "ngram4": self._serialize_ngram(self.ngram4),
-                "total_trigrams": self.total_trigrams,
-                "record_counter": self.record_counter,
-                "softmax_temperature": self.softmax_temperature,
-                "weight_factor": self.weight_factor,
-                "top_k": self.top_k,
-                "top_p": self.top_p,
-                "personality_bias": self.personality_bias,
-                "word2idx": self.word2idx,
-                "idx2word": self.idx2word
-            }
-            with open(self.model_file, 'w') as f:
-                json.dump(data, f, indent=4)
-            logging.info("Model saved successfully.")
+        if locker != True:
+            with self.lock:
+                data = {
+                    "unigram": self._serialize_counter(self.unigram),
+                    "bigram": {k: self._serialize_counter(v) for k, v in self.bigram.items()},
+                    "trigram": self._serialize_ngram(self.trigram),
+                    "ngram4": self._serialize_ngram(self.ngram4),
+                    "total_trigrams": self.total_trigrams,
+                    "record_counter": self.record_counter,
+                    "softmax_temperature": self.softmax_temperature,
+                    "weight_factor": self.weight_factor,
+                    "top_k": self.top_k,
+                    "top_p": self.top_p,
+                    "personality_bias": self.personality_bias,
+                    "word2idx": self.word2idx,
+                    "idx2word": self.idx2word
+                }
+                with open(self.model_file, 'w') as f:
+                    json.dump(data, f, indent=4)
+                logging.info("Model saved successfully.")
+        else:
+            return
 
     def load_model(self):
         if os.path.exists(self.model_file):
@@ -336,9 +341,11 @@ def re_train_model(epochs=5, batch_size=16, max_samples=150000):
 
 # --- Handler untuk Interrupt ---
 def handle_interrupt(signal_received, frame, chatbot):
+    global locker
     logging.info("Interrupt accepted, saving model...")
     chatbot.safe_save()
-    logging.info("Model saved, exiting.")
+    locker = True
+    logging.info("Model saved!, exiting.")
     exit(0)
 
 # --- Main Program: Hanya Mode Re-Training ---
@@ -356,7 +363,7 @@ def main():
     try:
         max_samples = int(input("Insert total sample [84400-150000]: "))
     except ValueError:
-        max_samples = 10000
+        max_samples = 150000
 
     # Daftarkan interrupt handler di main thread
     temp_model = NeuralChat()  # Instance sementara untuk handler
