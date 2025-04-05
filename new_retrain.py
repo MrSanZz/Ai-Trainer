@@ -89,8 +89,8 @@ class NeuralChat(nn.Module):
 
         # Komponen training
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.Adam(self.parameters(), lr=0.001)
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma=0.95)
+        self.optimizer = optim.Adam(self.parameters(), lr=0.001, weight_decay=1e-5)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=2, factor=0.5)
 
         # Untuk thread-safe update model
         self.lock = threading.Lock()
@@ -309,16 +309,19 @@ class NeuralChat(nn.Module):
                 break
         return " ".join(response)
 
-# --- Fungsi Re-Training Utama ---
 def re_train_model(epochs=5, batch_size=16, max_samples=150000):
     logging.info("Loading external dataset...")
     dataset_raw = load_dataset("OpenAssistant/oasst1", split="train")
     dataset = TextDataset(dataset_raw, max_samples=max_samples)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_data, val_data = torch.utils.data.random_split(dataset, [train_size, val_size])
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=batch_size)
 
     chatbot = NeuralChat()  # Muat model (atau buat baru jika tidak ada)
-    total_batches = len(dataloader)
-    logging.info(f"Starting re-training for {epochs} epoch with {len(dataset)} total sample, {total_batches} batch per epoch...")
+    total_batches = len(train_loader)
+    logging.info(f"Starting re-training for {epochs} epoch with {len(dataset)} total samples, {total_batches} batches per epoch...")
 
     for epoch in range(epochs):
         logging.info(f"Epoch {epoch + 1}/{epochs} started...")
@@ -326,17 +329,33 @@ def re_train_model(epochs=5, batch_size=16, max_samples=150000):
         batch_count = 0
         start_time = time.time()
 
-        for i, batch_sentences in enumerate(dataloader):
+        # Train Loop
+        chatbot.train()
+        for i, batch_sentences in enumerate(train_loader):
             loss, count = chatbot.train_batch(batch_sentences)
             epoch_loss += loss
             batch_count += count
-
             if (i + 1) % 100 == 0:
                 avg_loss = epoch_loss / batch_count if batch_count > 0 else 0
                 elapsed = time.time() - start_time
                 logging.info(f"Epoch {epoch+1}, Batch {i+1}/{total_batches}, Avg Loss: {avg_loss:.4f}, Elapsed: {elapsed:.2f}s")
 
-        logging.info(f"Epoch {epoch + 1} finished. Avg Loss: {epoch_loss / batch_count if batch_count > 0 else 0:.4f}")
+        # Validation Loss Calculation
+        chatbot.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch_sentences in val_loader:
+                loss, count = chatbot.train_batch(batch_sentences)
+                val_loss += loss
+
+        val_loss /= len(val_loader)
+        logging.info(f"Validation Loss for Epoch {epoch + 1}: {val_loss:.4f}")
+
+        # Step the scheduler with validation loss
+        chatbot.scheduler.step(val_loss)
+        
+        logging.info(f"Epoch {epoch + 1} finished. Avg Training Loss: {epoch_loss / batch_count if batch_count > 0 else 0:.4f}")
+
     chatbot.safe_save()
     logging.info("Re-training finished, model saved.")
 
