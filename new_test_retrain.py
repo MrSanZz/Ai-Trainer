@@ -185,7 +185,7 @@ class NeuralChat(nn.Module):
             # Terapkan gradient clipping
             torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
             self.optimizer.step()
-            self.scheduler.step()
+            self.scheduler.step(loss.item())
 
             batch_loss += loss.item()
             batch_count += 1
@@ -332,33 +332,37 @@ class NeuralChat(nn.Module):
             logging.warning("Sentiment model file not found, model will not be available.")
 
     def train_sentiment_model(self, texts, labels):
-        """Melatih model sentimen menggunakan TF-IDF + Logistic Regression."""
+        """Melatih model sentimen menggunakan scikit-learn."""
         X = self.vectorizer.fit_transform(texts)
         y = np.array(labels)
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        model = LogisticRegression(max_iter=1000)
-        model.fit(X_train, y_train)
+        # Split data untuk pelatihan dan validasi
+        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        y_pred = model.predict(X_test)
-        acc = accuracy_score(y_test, y_pred)
-        logging.info(f"Sentiment model trained. Test accuracy: {acc:.4f}")
+        # Melatih model Logistic Regression
+        sentiment_model = LogisticRegression(max_iter=1000)
+        sentiment_model.fit(X_train, y_train)
 
-        self.sentiment_model = model
+        # Evaluasi model
+        y_pred = sentiment_model.predict(X_val)
+        accuracy = accuracy_score(y_val, y_pred)
+        logging.info(f"Sentiment model training completed with accuracy: {accuracy:.4f}")
+
+        # Simpan model sentiment ke file
         with open(self.sentiment_model_file, 'wb') as f:
-            pickle.dump(self.sentiment_model, f)
+            pickle.dump(sentiment_model, f)
+            logging.info(f"Sentiment model saved to {self.sentiment_model_file}.")
 
-        return acc
+        self.sentiment_model = sentiment_model
 
     def predict_sentiment(self, text):
-        """Memprediksi sentimen dari teks input."""
-        if self.sentiment_model is None:
-            logging.warning("Sentiment model belum dimuat.")
-            return "unknown"
-
-        vec = self.vectorizer.transform([text])
-        prediction = self.sentiment_model.predict(vec)
-        return prediction[0]
+        """Prediksi sentimen dari teks menggunakan model yang sudah dilatih."""
+        if self.sentiment_model:
+            X = self.vectorizer.transform([text])
+            prediction = self.sentiment_model.predict(X)
+            sentiment = "Positive" if prediction[0] == 1 else "Negative"
+            return sentiment
+        return "Sentiment model not available."
 
     # --- Modifikasi method chat untuk analisis sentimen ---
     def chat(self, message):
