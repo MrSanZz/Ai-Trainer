@@ -353,7 +353,7 @@ def load_external_data():
                 text_data = row.get("text", "")
                 if text_data:
                     # Gunakan train_with_embeddings untuk update model dan mendapatkan embedding matrix
-                    embedding_matrix, linear_output = chatbot.train_with_embeddings(text_data)
+                    embedding_matrix, linear_output = threading.Thread(target=chatbot.train_with_embeddings, args=(text_data)).start()
             except Exception as inner_e:
                 logging.warning(f"Skipping row {idx} due to error: {inner_e}")
                 continue
@@ -401,7 +401,7 @@ def main():
     """
     mode = input("Choose mode (Train/Test/Validate): ").strip().lower()
     if mode == "train":
-        chatbot = threading.Thread(target=load_external_data).start()
+        chatbot = load_external_data()
         logging.info("Training finished. Model saved successfully.")
     elif mode == "test":
         threading.Thread(target=load_test_mode).start()
