@@ -302,14 +302,14 @@ class NeuralChat:
                 "personality_bias": self.personality_bias
             }
             with open(self.model_file, 'w') as f:
-                lambda: json.dump(data, f, indent=4)
+                json.dump(data, f, indent=4)
             logging.info("Model saved successfully.")
 
     def load_model(self):
         if os.path.exists(self.model_file):
             with open(self.model_file, 'r') as f:
                 try:
-                    model_data = lambda: json.load(f)
+                    model_data = json.load(f)
                     self.unigram = Counter(model_data.get("unigram", {}))
                     bigram_data = {k: Counter(v) for k, v in model_data.get("bigram", {}).items()}
                     self.bigram = defaultdict(Counter, bigram_data)
@@ -344,24 +344,27 @@ def handle_interrupt(signal_received, frame, chatbot):
 
 def load_external_data():
     from datasets import load_dataset
+    from concurrent.futures import ThreadPoolExecutor
     chatbot = NeuralChat()
     signal.signal(signal.SIGINT, lambda s, f: handle_interrupt(s, f, chatbot))
     try:
         dataset = load_dataset("OpenAssistant/oasst1", split="train")
-        for idx, row in enumerate(dataset):
-            try:
-                text_data = row.get("text", "")
-                if text_data:
-                    # Gunakan train_with_embeddings untuk update model dan mendapatkan embedding matrix
-                    embedding_matrix, linear_output = threading.Thread(target=chatbot.train_with_embeddings, args=(text_data)).start()
-            except Exception as inner_e:
-                logging.warning(f"Skipping row {idx} due to error: {inner_e}")
-                continue
+        # Batasi jumlah thread agar tidak membuat sistem overload
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            for idx, row in enumerate(dataset):
+                try:
+                    text_data = row.get("text", "")
+                    if text_data:
+                        # Pastikan args berupa tuple, dan submit task ke executor
+                        executor.submit(chatbot.train_with_embeddings, text_data)
+                except Exception as inner_e:
+                    logging.warning(f"Skipping row {idx} due to error: {inner_e}")
+                    continue
 
-            if idx % 1000 == 0 and idx > 0:
-                size_kb = lambda: os.path.getsize(chatbot.model_file) / 1024 if os.path.exists(chatbot.model_file) else 0
-                print(f"Processed {idx} records, model size: {size_kb:.2f} KB", end='\r')
-            time.sleep(0.005)
+                if idx % 1000 == 0 and idx > 0:
+                    size_kb = os.path.getsize(chatbot.model_file) / 1024 if os.path.exists(chatbot.model_file) else 0
+                    print(f"Processed {idx} records, model size: {size_kb:.2f} KB", end='\r')
+                time.sleep(0.005)
     except Exception as e:
         logging.error(f"Failed to load dataset OpenAssistant: {str(e)}")
     return chatbot
