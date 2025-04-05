@@ -19,6 +19,7 @@ locker = False
 
 # Pastikan resource NLTK sudah tersedia
 nltk.download('punkt')
+nltk.download('punkt_tab')
 
 # Konfigurasi logging yang lebih detail
 logging.basicConfig(
