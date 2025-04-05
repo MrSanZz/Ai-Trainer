@@ -376,7 +376,7 @@ def load_test_mode():
         user_input = input("You: ")
         if user_input.lower() == "exit":
             break
-        chatbot.test(user_input)
+        NeuralChat().chat(user_input)
 
 def validate_training():
     """
