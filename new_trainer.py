@@ -302,14 +302,14 @@ class NeuralChat:
                 "personality_bias": self.personality_bias
             }
             with open(self.model_file, 'w') as f:
-                json.dump(data, f, indent=4)
+                lambda: json.dump(data, f, indent=4)
             logging.info("Model saved successfully.")
 
     def load_model(self):
         if os.path.exists(self.model_file):
             with open(self.model_file, 'r') as f:
                 try:
-                    model_data = json.load(f)
+                    model_data = lambda: json.load(f)
                     self.unigram = Counter(model_data.get("unigram", {}))
                     bigram_data = {k: Counter(v) for k, v in model_data.get("bigram", {}).items()}
                     self.bigram = defaultdict(Counter, bigram_data)
@@ -359,7 +359,7 @@ def load_external_data():
                 continue
 
             if idx % 1000 == 0 and idx > 0:
-                size_kb = os.path.getsize(chatbot.model_file) / 1024 if os.path.exists(chatbot.model_file) else 0
+                size_kb = lambda: os.path.getsize(chatbot.model_file) / 1024 if os.path.exists(chatbot.model_file) else 0
                 print(f"Processed {idx} records, model size: {size_kb:.2f} KB", end='\r')
             time.sleep(0.005)
     except Exception as e:
@@ -401,12 +401,12 @@ def main():
     """
     mode = input("Choose mode (Train/Test/Validate): ").strip().lower()
     if mode == "train":
-        chatbot = load_external_data()
+        chatbot = threading.Thread(target=load_external_data).start()
         logging.info("Training finished. Model saved successfully.")
     elif mode == "test":
-        load_test_mode()
+        threading.Thread(target=load_test_mode).start()
     elif mode == "validate":
-        validate_training()
+        threading.Thread(target=validate_training).start()
     else:
         logging.error("Not a valid mode, please choose 'Train', 'Test', or 'Validate' mode!.")
 
