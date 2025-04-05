@@ -370,17 +370,11 @@ def load_external_data():
     return chatbot
 
 def load_test_mode():
-    """
-    Mode test untuk interaksi langsung dengan chatbot.
-    Setiap input pengguna dipelajari dan diproses.
-    """
-    chatbot = NeuralChat()
-    signal.signal(signal.SIGINT, lambda s, f: handle_interrupt(s, f, chatbot))
+    # Jangan panggil signal.signal() di sini karena mode test dijalankan sebagai thread
     print("Entering chat mode. Type 'exit' to interrupt.")
     while True:
         user_input = input("You: ")
         if user_input.lower() == "exit":
-            chatbot.safe_save()
             break
         chatbot.test(user_input)
 
@@ -407,9 +401,9 @@ def main():
         chatbot = load_external_data()
         logging.info("Training finished. Model saved successfully.")
     elif mode == "test":
-        threading.Thread(target=load_test_mode).start()
+        load_test_mode()
     elif mode == "validate":
-        threading.Thread(target=validate_training).start()
+        validate_training()
     else:
         logging.error("Not a valid mode, please choose 'Train', 'Test', or 'Validate' mode!.")
 
