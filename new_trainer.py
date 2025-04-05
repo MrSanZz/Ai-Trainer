@@ -370,13 +370,14 @@ def load_external_data():
     return chatbot
 
 def load_test_mode():
-    # Jangan panggil signal.signal() di sini karena mode test dijalankan sebagai thread
+    chatbot = NeuralChat()  # Buat satu instance
     print("Entering chat mode. Type 'exit' to interrupt.")
     while True:
         user_input = input("You: ")
         if user_input.lower() == "exit":
             break
-        NeuralChat().chat(user_input)
+        response = chatbot.chat(user_input)  # Gunakan instance yang sama
+        print(f"AI: {response}")
 
 def validate_training():
     """
