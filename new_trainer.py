@@ -12,6 +12,8 @@ from nltk.tokenize import word_tokenize
 import torch
 import torch.nn as nn
 
+locker = False
+
 # Pastikan nltk telah mengunduh resource yang diperlukan
 nltk.download('punkt')
 nltk.download('punkt_tab')
@@ -287,23 +289,26 @@ class NeuralChat:
         print(f"AI: {response}")
 
     def safe_save(self):
-        with self.lock:
-            data = {
-                "unigram": self._serialize_counter(self.unigram),
-                "bigram": {k: self._serialize_counter(v) for k, v in self.bigram.items()},
-                "trigram": self._serialize_ngram(self.trigram),
-                "ngram4": self._serialize_ngram(self.ngram4),
-                "total_trigrams": self.total_trigrams,
-                "record_counter": self.record_counter,
-                "softmax_temperature": self.softmax_temperature,
-                "weight_factor": self.weight_factor,
-                "top_k": self.top_k,
-                "top_p": self.top_p,
-                "personality_bias": self.personality_bias
-            }
-            with open(self.model_file, 'w') as f:
-                json.dump(data, f, indent=4)
-            logging.info("Model saved successfully.")
+        if locker != True:
+            with self.lock:
+                data = {
+                    "unigram": self._serialize_counter(self.unigram),
+                    "bigram": {k: self._serialize_counter(v) for k, v in self.bigram.items()},
+                    "trigram": self._serialize_ngram(self.trigram),
+                    "ngram4": self._serialize_ngram(self.ngram4),
+                    "total_trigrams": self.total_trigrams,
+                    "record_counter": self.record_counter,
+                    "softmax_temperature": self.softmax_temperature,
+                    "weight_factor": self.weight_factor,
+                    "top_k": self.top_k,
+                    "top_p": self.top_p,
+                    "personality_bias": self.personality_bias
+                }
+                with open(self.model_file, 'w') as f:
+                    json.dump(data, f, indent=4)
+                logging.info("Model saved successfully!.")
+        else:
+            return
 
     def load_model(self):
         if os.path.exists(self.model_file):
@@ -334,11 +339,13 @@ class NeuralChat:
                     self.record_counter = 0
 
 def handle_interrupt(signal_received, frame, chatbot):
+    global locker
     """
     Menyimpan model dengan aman sebelum keluar ketika terjadi interupsi.
     """
     logging.info("Saving model before exiting...")
     chatbot.safe_save()
+    locker = True
     logging.info("Model saved successfully!.")
     exit(0)
 
