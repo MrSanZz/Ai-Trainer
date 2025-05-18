@@ -19,26 +19,73 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 import pickle
-
+from torch.optim.lr_scheduler import LambdaLR
+import math, re
 locker = False
 
-# Pastikan resource NLTK sudah tersedia
 nltk.download('punkt')
 nltk.download('punkt_tab')
 
-# Konfigurasi logging yang lebih detail
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+def get_linear_schedule_with_warmup(optimizer, warmup_steps=100, total_steps=1000):
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        return max(
+            0.0, float(total_steps - current_step) / float(max(1, total_steps - warmup_steps))
+        )
+    return LambdaLR(optimizer, lr_lambda)
+
+def is_valid(text):
+    if not text or len(text) < 10:
+        return False
+    if any(c in text for c in ['http', '@', '#']):
+        return False
+    if sum(1 for c in text if c.isupper()) > 30:
+        return False
+    if len(text.split()) > 100:
+        return False
+    if re.search(r'[^a-zA-Z0-9\s.,!?\'\"-]', text):
+        return False
+    return True
+
+class EarlyStopping:
+    def __init__(self, patience=3, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = float('inf')
+
+    def check(self, val_loss):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            return False
+        else:
+            self.counter += 1
+            return self.counter >= self.patience
+
 class TextDataset(Dataset):
-    """Wrapper dataset untuk mengambil field 'text' dari dataset eksternal."""
+    """ambil field terus bersihin data g guna."""
     def __init__(self, dataset, max_samples=None):
-        self.samples = [row["text"] for row in dataset if row.get("text")]
-        if max_samples is not None:
-            self.samples = self.samples[:max_samples]
+        def is_valid(text):
+            if not text or len(text) < 10:
+                return False
+            if any(c in text for c in ['http', '@', '#']):
+                return False
+            if sum(1 for c in text if c.isupper()) > 30:
+                return False
+            if len(text.split()) > 100:
+                return False
+            return True
+
+        cleaned = [row["text"] for row in dataset if "text" in row and is_valid(row["text"])]
+        self.samples = cleaned[:max_samples] if max_samples else cleaned
 
     def __len__(self):
         return len(self.samples)
@@ -46,22 +93,46 @@ class TextDataset(Dataset):
     def __getitem__(self, idx):
         return self.samples[idx]
 
+def log_gradient_info(loss, grad_norm, count):
+    if count == 0:
+        return {"loss": 0, "grad_norm": 0}
+    return {
+        "loss": loss / count,
+        "grad_norm": grad_norm / count
+    }
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+        
+    def forward(self, x):
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
 class NeuralChat(nn.Module):
-    def __init__(self,
+    def __init__(self, 
                  model_file='ai_model.json',
-                 softmax_temperature=0.7,
-                 weight_factor=1.2,
+                 softmax_temperature=0.025,
+                 weight_factor=2.4,
                  top_k=20,
-                 top_p=0.9,
+                 top_p=1.0,
                  personality_bias=None,
                  context_window=50,
                  response_length_factor=1.0,
-                 embedding_dim=128,
-                 init_vocab_size=10000,
-                 sentiment_model_file='sentiment_model.pkl'):
-        """
-        Inisialisasi model NeuralChat dengan komponen n-gram dan neural network.
-        """
+                 embedding_dim=256,  # Diperbesar
+                 hidden_dim=512,     # Ditambahkan
+                 n_layers=4,         # Ditambahkan
+                 init_vocab_size=10000,  # Diperbesar
+                 sentiment_model_file='sentiment_model.pkl',
+                 dropout=0.2):       # Ditambahkan
         super(NeuralChat, self).__init__()
         self.model_file = model_file
         self.softmax_temperature = softmax_temperature
@@ -72,8 +143,9 @@ class NeuralChat(nn.Module):
         self.context_window = context_window
         self.response_length_factor = response_length_factor
         self.sentiment_model_file = sentiment_model_file
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)
 
-        # Struktur n-gram untuk statistik tambahan
         self.unigram = Counter()
         self.bigram = defaultdict(Counter)
         self.trigram = defaultdict(Counter)
@@ -81,37 +153,42 @@ class NeuralChat(nn.Module):
         self.total_trigrams = 0
         self.record_counter = 0
 
-        # Komponen neural network: embedding dan fully-connected network
         self.embedding_dim = embedding_dim
         self.vocab_size = init_vocab_size
         self.word2idx = {'<unk>': 0}
         self.idx2word = {0: '<unk>'}
         self.embedding = nn.Embedding(self.vocab_size, self.embedding_dim)
+        self.pos_encoder = PositionalEncoding(embedding_dim, dropout)  # Ditambahkan
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=8,
+            dim_feedforward=hidden_dim,
+            dropout=dropout
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            self.encoder_layer,
+            num_layers=n_layers
+        )
+        self.rnn = nn.LSTM(self.embedding_dim, self.embedding_dim, batch_first=True)
         self.fc = nn.Sequential(
-            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.Linear(embedding_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(self.embedding_dim, self.vocab_size)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.vocab_size)
         )
 
-        # Komponen training
-        self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.Adam(self.parameters(), lr=0.001, weight_decay=1e-5)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=2, factor=0.5)
-
-        # Untuk thread-safe update model
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1, ignore_index=0)
+        self.optimizer = optim.AdamW(self.parameters(), lr=5e-5, weight_decay=1e-5)
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.95)
         self.lock = threading.Lock()
 
-        # Muat model jika file ada dan reprocess data
         self.load_model()
         self.reprocess_model_data()
 
-        # Muat model sentimen jika ada
         self.sentiment_model = None
-        self.vectorizer = TfidfVectorizer(max_features=5000)  # TF-IDF untuk representasi kata
+        self.vectorizer = TfidfVectorizer(max_features=5000)
         self.load_sentiment_model()
 
-    # --- Serialization Methods ---
     def _serialize_counter(self, counter_obj):
         return dict(counter_obj)
 
@@ -129,70 +206,67 @@ class NeuralChat(nn.Module):
             ngram[key] = Counter(value)
         return ngram
 
-    # --- Vocabulary Update ---
     def update_vocab(self, tokens):
-        new_tokens = False
+        new_token_added = False
         for token in tokens:
+            if not token.isalpha() or len(token) > 25:
+                continue
             if token not in self.word2idx:
-                new_tokens = True
                 idx = len(self.word2idx)
                 self.word2idx[token] = idx
                 self.idx2word[idx] = token
-        if new_tokens:
-            # Update ukuran vocabulary dan reinitialize embedding serta fc layer
-            self.vocab_size = len(self.word2idx)
-            self.embedding = nn.Embedding(self.vocab_size, self.embedding_dim)
-            self.fc[-1] = nn.Linear(self.embedding_dim, self.vocab_size)
+                new_token_added = True
+        if new_token_added:
+            logging.debug(f"[VOCAB] New vocab size: {len(self.word2idx)}")
+            old_weight = self.embedding.weight.data
+            new_vocab_size = len(self.word2idx)
+            new_embedding = nn.Embedding(new_vocab_size, self.embedding_dim)
+            new_embedding.weight.data[:old_weight.size(0)] = old_weight
+            self.embedding = new_embedding
 
-    # --- Neural Network Training Step (Batch) ---
-    def train_batch(self, batch_sentences):
-        batch_loss = 0.0
-        batch_count = 0
+            old_fc_weight = self.fc[-1].weight.data
+            new_fc = nn.Linear(self.embedding_dim, new_vocab_size)
+            new_fc.weight.data[:old_fc_weight.size(0)] = old_fc_weight
+            self.fc[-1] = new_fc
+            self.vocab_size = new_vocab_size
 
-        for sentence in batch_sentences:
-            tokens = word_tokenize(sentence.lower())
-            if not tokens or len(tokens) < 2:
+    def train_batch(self, sentences):
+        self.train()
+        total_loss = 0
+        count = 0
+        total_grad_norm = 0.0
+        acc_steps = 4
+        
+        for sentence in sentences:
+            tokens = [t for t in word_tokenize(sentence.lower()) if t.isalpha()]
+            if len(tokens) < 2 or len(tokens) > 150:
                 continue
-
-            # Update statistik n-gram secara thread-safe
-            with self.lock:
-                self.unigram.update(tokens)
-                for i in range(len(tokens) - 1):
-                    self.bigram[tokens[i]].update([tokens[i + 1]])
-                for i in range(len(tokens) - 2):
-                    key = (tokens[i], tokens[i + 1])
-                    self.trigram[key].update([tokens[i + 2]])
-                    self.total_trigrams += 1
-                for i in range(len(tokens) - 3):
-                    key = (tokens[i], tokens[i + 1], tokens[i + 2])
-                    self.ngram4[key].update([tokens[i + 3]])
-                self.record_counter += 1
-
-            # Update vocabulary secara batch
             self.update_vocab(tokens)
-            indices = [self.word2idx.get(token, 0) for token in tokens]
-            indices = torch.tensor(indices, dtype=torch.long)
-            if len(indices) < 2:
+            idx = torch.tensor([self.word2idx.get(t, 0) for t in tokens], 
+                            dtype=torch.long, device=self.device)
+            
+            if len(idx) < 2:
                 continue
 
-            # Forward pass
-            self.optimizer.zero_grad()
-            embeddings = self.embedding(indices[:-1])
-            outputs = self.fc(embeddings)
-            loss = self.criterion(outputs, indices[1:])
+            self.update_ngram_stats(" ".join(tokens))
+            src = self.embedding(idx[:-1].unsqueeze(0))
+            src = self.pos_encoder(src)
+            output = self.transformer_encoder(src)
+            logits = self.fc(output.squeeze(0))
+            
+            loss = self.criterion(logits, idx[1:]) / acc_steps
             loss.backward()
+            total_loss += loss.item() * acc_steps
+            count += 1
+            
+            if count % acc_steps == 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                total_grad_norm += grad_norm.item()
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+        
+        return total_loss, count, total_grad_norm
 
-            # Terapkan gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            self.scheduler.step(loss.item())
-
-            batch_loss += loss.item()
-            batch_count += 1
-
-        return batch_loss, batch_count
-
-    # --- Save / Load & Reprocess ---
     def safe_save(self):
         if locker != True:
             with self.lock:
@@ -264,21 +338,103 @@ class NeuralChat(nn.Module):
         self.word2idx = model_data.get("word2idx", self.word2idx)
         self.idx2word = model_data.get("idx2word", self.idx2word)
         self.vocab_size = len(self.word2idx)
-        # Perbarui embedding dan layer output agar sesuai dengan vocabulary terbaru
-        self.embedding = nn.Embedding(self.vocab_size, self.embedding_dim)
+        self.embedding = nn.Sequential(
+            nn.Embedding(self.vocab_size, self.embedding_dim),
+            nn.Dropout(0.1)
+        )
         self.fc[-1] = nn.Linear(self.embedding_dim, self.vocab_size)
         logging.info("Reprocessing model data finished: n-gram, vocabulary, and neural components has been updated.")
 
-    # --- Sampling Methods ---
     def softmax(self, logits):
         logits = np.array(logits) / self.softmax_temperature
         exp_logits = np.exp(logits - np.max(logits))
         return exp_logits / np.sum(exp_logits)
+    
+    def top_k_top_p_sampling2(self, counter):
+        if not counter:
+            return '<unk>'  # fallback
 
-    def top_k_top_p_sampling(self, counter):
-        # Terapkan bias ke counter
+        biased = {
+            word: count * self.personality_bias.get(word, 1.0)
+            for word, count in counter.items()
+            if word in self.word2idx
+        }
+
+        if not biased:
+            return '<unk>'
+
+        words = list(biased.keys())
+        counts = np.array(list(biased.values()), dtype=float)
+        logits = np.log(counts * self.weight_factor + 1e-10)
+
+        sorted_idx = np.argsort(logits)[::-1]
+        sorted_words = [words[i] for i in sorted_idx][:self.top_k]
+        sorted_logits = logits[sorted_idx][:self.top_k]
+
+        probs = np.exp(sorted_logits) / np.sum(np.exp(sorted_logits))
+        cumulative = np.cumsum(probs)
+        cutoff = cumulative <= self.top_p
+        if not np.any(cutoff):
+            cutoff[-1] = True
+
+        final_words = [w for w, flag in zip(sorted_words, cutoff) if flag]
+        final_probs = np.exp(sorted_logits[:len(final_words)])
+        final_probs /= np.sum(final_probs)
+
+        chosen = random.choices(final_words, weights=final_probs)[0]
+        return chosen
+    
+    def get_context_prompt(self):
+        return " ".join(self.conversation_history) if hasattr(self, "conversation_history") else ""
+
+    def update_history(self, user_message, ai_response):
+        if not hasattr(self, "conversation_history"):
+            self.conversation_history = []
+        self.conversation_history.append(f"User: {user_message}")
+        self.conversation_history.append(f"AI: {ai_response}")
+        combined = " ".join(self.conversation_history)
+        tokens = word_tokenize(combined)
+        if len(tokens) > self.context_window:
+            tokens = tokens[-self.context_window:]
+            self.conversation_history = [" ".join(tokens)]
+
+    def update_ngram_stats(self, sentence):
+        tokens = word_tokenize(sentence.lower())
+        if not tokens:
+            return
+        with self.lock:
+            self.unigram.update(tokens)
+            for i in range(len(tokens) - 1):
+                self.bigram[tokens[i]].update([tokens[i + 1]])
+            for i in range(len(tokens) - 2):
+                key = (tokens[i], tokens[i + 1])
+                self.trigram[key].update([tokens[i + 2]])
+                self.total_trigrams += 1
+            for i in range(len(tokens) - 3):
+                key = (tokens[i], tokens[i + 1], tokens[i + 2])
+                self.ngram4[key].update([tokens[i + 3]])
+            self.record_counter += 1
+        if self.record_counter % 2500 == 0:
+            threading.Thread(target=self.safe_save).start()
+
+    def top_k_top_p_sampling(self, logits, top_k=50, top_p=0.9):
+        logits = np.asarray(logits)
+        if logits.size == 0:
+            raise ValueError("Logits is empty, cannot perform sampling.")
+
+        sorted_indices = np.argsort(logits)[::-1]
+        sorted_logits = logits[sorted_indices]
+        
+        cumulative_probs = np.cumsum(self.softmax(sorted_logits))
+        cutoff = cumulative_probs <= top_p
+        cutoff[:top_k] = True
+        if cutoff.size > 0:
+            cutoff[-1] = True
+        else:
+            raise ValueError("Cutoff array is empty after thresholding.")
         biased = {word: count * self.personality_bias.get(word, 1.0)
-                  for word, count in counter.items()}
+                 for word, count in logits.items()
+                 if word in self.word2idx}
         words = list(biased.keys())
         counts = np.array(list(biased.values()), dtype=float)
         logits = np.log(counts * self.weight_factor + 1e-10)
@@ -305,25 +461,49 @@ class NeuralChat(nn.Module):
         base = random.randint(min_length, max_length)
         return int(base * self.response_length_factor)
 
-    # --- Generation ---
-    def generate_response(self, prompt, max_length=None):
+    def generate_response(self, prompt, max_length=None, temperature=None):
+        self.eval()
         tokens = word_tokenize(prompt.lower())
-        response = tokens[:self.context_window]
-        max_length = max_length or self.determine_response_length(response)
-        for _ in range(max_length):
-            last_token = response[-1] if response else '<unk>'
-            candidates = self.bigram.get(last_token, {})
-            if not candidates:
-                break
-            next_token = self.top_k_top_p_sampling(candidates)
-            response.append(next_token)
-            if next_token in ['.', '!', '?']:
-                break
-        return " ".join(response)
+        token_ids = [self.word2idx.get(t, 0) for t in tokens if t.isalpha()]
+        
+        if not token_ids:
+            return "I don't understand that input."
+            
+        max_length = max_length or self.determine_response_length(tokens)
+        temp = temperature or self.softmax_temperature
+        
+        with torch.no_grad():
+            input_ids = torch.tensor(token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+            
+            for _ in range(max_length):
+                emb = self.embedding(input_ids)
+                emb = self.pos_encoder(emb)
+                output = self.transformer_encoder(emb)
+                logits = self.fc(output[:, -1, :])
+                
+                probs = torch.softmax(logits / temp, dim=-1)
+                top_probs, top_indices = torch.topk(probs, self.top_k)
+                
+                if self.top_p < 1.0:
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > self.top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                    probs[..., indices_to_remove] = 0
+                    probs = probs / probs.sum()
+                
+                next_token = torch.multinomial(probs, num_samples=1)
+                input_ids = torch.cat([input_ids, next_token], dim=-1)
+                
+                if self.idx2word.get(next_token.item(), '') in ['.', '!', '?']:
+                    break
+                    
+        generated_ids = input_ids[0, len(token_ids):].tolist()
+        return ' '.join([self.idx2word.get(idx, '') for idx in generated_ids if idx in self.idx2word])
 
-    # --- Sentiment Model Methods ---
     def load_sentiment_model(self):
-        """Memuat model sentimen yang sudah dilatih sebelumnya."""
         if os.path.exists(self.sentiment_model_file):
             with open(self.sentiment_model_file, 'rb') as f:
                 self.sentiment_model = pickle.load(f)
@@ -332,23 +512,17 @@ class NeuralChat(nn.Module):
             logging.warning("Sentiment model file not found, model will not be available.")
 
     def train_sentiment_model(self, texts, labels):
-        """Melatih model sentimen menggunakan scikit-learn."""
         X = self.vectorizer.fit_transform(texts)
         y = np.array(labels)
 
-        # Split data untuk pelatihan dan validasi
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-
-        # Melatih model Logistic Regression
         sentiment_model = LogisticRegression(max_iter=1000)
         sentiment_model.fit(X_train, y_train)
 
-        # Evaluasi model
         y_pred = sentiment_model.predict(X_val)
         accuracy = accuracy_score(y_val, y_pred)
         logging.info(f"Sentiment model training completed with accuracy: {accuracy:.4f}")
 
-        # Simpan model sentiment ke file
         with open(self.sentiment_model_file, 'wb') as f:
             pickle.dump(sentiment_model, f)
             logging.info(f"Sentiment model saved to {self.sentiment_model_file}.")
@@ -356,7 +530,6 @@ class NeuralChat(nn.Module):
         self.sentiment_model = sentiment_model
 
     def predict_sentiment(self, text):
-        """Prediksi sentimen dari teks menggunakan model yang sudah dilatih."""
         if self.sentiment_model:
             X = self.vectorizer.transform([text])
             prediction = self.sentiment_model.predict(X)
@@ -364,73 +537,114 @@ class NeuralChat(nn.Module):
             return sentiment
         return "Sentiment model not available."
 
-    # --- Modifikasi method chat untuk analisis sentimen ---
     def chat(self, message):
-        """
-        Menggabungkan pesan terbaru dengan riwayat percakapan untuk digunakan sebagai prompt.
-        Model akan belajar dari pesan baru sekaligus menggunakan konteks sebelumnya.
-        """
-        sentiment = self.predict_sentiment(message)  # Prediksi sentimen pesan
+        sentiment = self.predict_sentiment(message)
         context_prompt = self.get_context_prompt()
         full_prompt = f"{context_prompt} {message}" if context_prompt else message
-        self.train(full_prompt)
-        tokens = word_tokenize(full_prompt.lower())
-        response = self.generate_response(tokens)
-        self.update_history(message, response)
-        return response
+        self.update_ngram_stats(full_prompt)
+        
+        tokens = [t for t in word_tokenize(full_prompt.lower()) if t.isalpha()]
+        if len(tokens) < 2:
+            return "[Input terlalu pendek untuk dihitung loss-nya.]"
 
-# --- Re-training Model ---
+        idx = torch.tensor([self.word2idx.get(t, 0) for t in tokens], dtype=torch.long, device=self.device)
+        self.embedding = self.embedding.to(self.device)
+        emb = self.embedding(idx[:-1])
+        out = self.fc(emb)
+        loss = self.criterion(out, idx[1:])
+
+        # Logging seperti training
+        logging.warning(f"[TextDebug] Token len: {len(tokens)}, Loss: {loss.item():.2f}, Text: {message[:100]}")
+        
+        # Return ke user juga dalam bentuk string
+        return f"[TextDebug] Token len: {len(tokens)}, Loss: {loss.item():.2f}, Text: {message[:100]}"
+
+def build_vocab_from_dataset(dataset, model):
+    filter_tokens = {'user', 'ai', 'user:', 'ai:', 'system'}
+    for sentence in dataset:
+        tokens = [t for t in word_tokenize(sentence.lower()) if t not in filter_tokens]
+        for token in tokens:
+            if token not in model.word2idx:
+                idx = len(model.word2idx)
+                model.word2idx[token] = idx
+                model.idx2word[idx] = token
+    model.vocab_size = len(model.word2idx)
+    model.embedding = nn.Embedding(model.vocab_size, model.embedding_dim)
+    model.fc = nn.Sequential(
+        nn.Linear(model.embedding_dim, model.embedding_dim),
+        nn.ReLU(),
+        nn.Dropout(0.4),
+        nn.Linear(model.embedding_dim, model.vocab_size)
+    )
+
 def re_train_model(epochs=5, batch_size=16, max_samples=150000):
     logging.info("Loading external dataset...")
     dataset_raw = load_dataset("OpenAssistant/oasst1", split="train")
-    dataset = TextDataset(dataset_raw, max_samples=max_samples)
+    filtered_data = [row for row in dataset_raw if row.get("role") == "assistant" and isinstance(row.get("text"), str)]
+    dataset = TextDataset(filtered_data, max_samples=max_samples)
+
+    chatbot = NeuralChat()
+    build_vocab_from_dataset(dataset, chatbot)
+
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_data, val_data = torch.utils.data.random_split(dataset, [train_size, val_size])
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=batch_size)
-
-    chatbot = NeuralChat()  # Muat model (atau buat baru jika tidak ada)
-    total_batches = len(train_loader)
-    logging.info(f"Starting re-training for {epochs} epoch with {len(dataset)} total samples, {total_batches} batches per epoch...")
+    early_stopper = EarlyStopping(patience=3)
 
     for epoch in range(epochs):
-        logging.info(f"Epoch {epoch + 1}/{epochs} started...")
         epoch_loss = 0.0
         batch_count = 0
+        grad_norm = 0.0 
         start_time = time.time()
 
-        # Train Loop
         chatbot.train()
         for i, batch_sentences in enumerate(train_loader):
-            loss, count = chatbot.train_batch(batch_sentences)
+            loss, count, g = chatbot.train_batch(batch_sentences)
             epoch_loss += loss
             batch_count += count
-            if (i + 1) % 100 == 0:
-                avg_loss = epoch_loss / batch_count if batch_count > 0 else 0
+            grad_norm += g
+            if (i + 1) % 10 == 0:
+                metrics = log_gradient_info(epoch_loss, grad_norm, count)
+                avg_loss = metrics["loss"]
+                avg_grad_norm = metrics["grad_norm"]
                 elapsed = time.time() - start_time
-                logging.info(f"Epoch {epoch+1}, Batch {i+1}/{total_batches}, Avg Loss: {avg_loss:.4f}, Elapsed: {elapsed:.2f}s")
+                print(json.dumps({
+                    "epoch": epoch + 1,
+                    "loss": avg_loss,
+                    "learn_rate": chatbot.optimizer.param_groups[0]['lr'],
+                    "grad_norm": avg_grad_norm,
+                    "elapsed": elapsed
+                }))
+        chatbot.scheduler.step()
+        torch.save(chatbot.state_dict(), f'checkpoint_epoch{epoch+1}.pt')
 
-        # Validation Loss Calculation
         chatbot.eval()
-        val_loss = 0.0
         with torch.no_grad():
-            for batch_sentences in val_loader:
-                loss, count = chatbot.train_batch(batch_sentences)
-                val_loss += loss
-
-        val_loss /= len(val_loader)
-        logging.info(f"Validation Loss for Epoch {epoch + 1}: {val_loss:.4f}")
-
-        # Step the scheduler with validation loss
-        chatbot.scheduler.step(val_loss)
-        
-        logging.info(f"Epoch {epoch + 1} finished. Avg Training Loss: {epoch_loss / batch_count if batch_count > 0 else 0:.4f}")
+            val_loss = 0
+            val_count = 0
+            for batch in val_loader:
+                for sentence in batch:
+                    tokens = word_tokenize(sentence.lower())
+                    if len(tokens) < 2:
+                        continue
+                    idx = torch.tensor([chatbot.word2idx.get(t, 0) for t in tokens], dtype=torch.long, device=chatbot.device)
+                    if len(idx) < 2:
+                        continue
+                    emb = chatbot.embedding(idx[:-1])
+                    out = chatbot.fc(emb)
+                    loss = chatbot.criterion(out, idx[1:])
+                    val_loss += loss.item()
+                    val_count += 1
+            val_loss /= val_count if val_count else 1
+            if early_stopper.check(val_loss):
+                logging.info(f"Early stopping at epoch {epoch+1} with val_loss {val_loss:.4f}")
+                break
 
     chatbot.safe_save()
     logging.info("Re-training finished, model saved.")
 
-# --- Handler untuk Interrupt ---
 def handle_interrupt(signal_received, frame, chatbot):
     global locker
     logging.info("Interrupt accepted, saving model...")
@@ -439,27 +653,41 @@ def handle_interrupt(signal_received, frame, chatbot):
     logging.info("Model saved!, exiting.")
     exit(0)
 
-# --- Main Program: Hanya Mode Re-Training ---
 def main():
-    try:
-        epochs = int(input("Insert Epochs [5-10]: "))
-    except ValueError:
-        epochs = 5
+    mode = input("Enter mode [chat/retrain]: ").strip().lower()
 
-    try:
-        batch_size = int(input("Insert batch size [16, 32, 64, 128]: "))
-    except ValueError:
-        batch_size = 16
+    if mode == "retrain":
+        try:
+            epochs = int(input("Insert Epochs [5-10]: "))
+        except ValueError:
+            epochs = 5
 
-    try:
-        max_samples = int(input("Insert total sample [84400-150000]: "))
-    except ValueError:
-        max_samples = 150000
+        try:
+            batch_size = int(input("Insert batch size [16, 32, 64, 128]: "))
+        except ValueError:
+            batch_size = 16
 
-    # Daftarkan interrupt handler di main thread
-    temp_model = NeuralChat()  # Instance sementara untuk handler
-    signal.signal(signal.SIGINT, lambda s, f: handle_interrupt(s, f, temp_model))
-    re_train_model(epochs=epochs, batch_size=batch_size, max_samples=max_samples)
+        try:
+            max_samples = int(input("Insert total sample [84400-150000]: "))
+        except ValueError:
+            max_samples = 150000
+
+        temp_model = NeuralChat()
+        signal.signal(signal.SIGINT, lambda s, f: handle_interrupt(s, f, temp_model))
+        re_train_model(epochs=epochs, batch_size=batch_size, max_samples=max_samples)
+
+    elif mode == "chat":
+        chatbot = NeuralChat()
+        print("Chat mode activated. Type 'exit' to quit.")
+        while True:
+            user_input = input("You: ")
+            if user_input.lower() in ['exit', 'quit']:
+                print("Exiting chat mode.")
+                break
+            response = chatbot.generate_response(user_input)
+            print(f"AI: {response}")
+    else:
+        print("Invalid mode. Please type 'chat' or 'retrain'.")
 
 if __name__ == "__main__":
     main()
