@@ -15,16 +15,21 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
+import re
 
 locker = False
 
-# Pastikan nltk telah mengunduh resource yang diperlukan
 nltk.download('punkt')
 nltk.download('punkt_tab')
+texts_for_sentiment = []
+labels_for_sentiment = []
 
-# Set up logging for monitoring training progress
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+def clean_text(text):
+    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)  # hapus simbol asing
+    text = text.lower().strip()
+    return text
 
 class NeuralChat:
     def __init__(self, model_file='ai_model.json', softmax_temperature=0.7, weight_factor=1.2,
@@ -39,7 +44,7 @@ class NeuralChat:
         self.unigram = Counter()
         self.bigram = defaultdict(Counter)
         self.trigram = defaultdict(Counter)
-        self.ngram4 = defaultdict(Counter)  # Opsional: n-gram 4 untuk konteks lebih panjang
+        self.ngram4 = defaultdict(Counter)
         self.total_trigrams = 0
         self.record_counter = 0
         self.softmax_temperature = softmax_temperature
@@ -49,27 +54,25 @@ class NeuralChat:
         self.personality_bias = personality_bias if personality_bias is not None else {}
         self.context_window = context_window
         self.response_length_factor = response_length_factor
-        self.conversation_history = []  # Menyimpan riwayat pesan dalam format string
+        self.conversation_history = []
         self.lock = threading.Lock()
         ###############################
         self.word2idx = {'<unk>': 0}
         self.idx2word = {0: '<unk>'}
-        self.vocab_size = 10000  # Bisa diupdate secara dinamis
+        self.vocab_size = 10000
         self.embedding_dim = 128
         self.embedding_layer = nn.Embedding(self.vocab_size, self.embedding_dim)
         self.linear_layer = nn.Linear(self.embedding_dim, self.embedding_dim)
         ###############################
         self.sentiment_model_file = sentiment_model_file
         self.sentiment_model = None
-        self.vectorizer = TfidfVectorizer(max_features=5000)  # Menggunakan TF-IDF untuk representasi kata
+        self.vectorizer = TfidfVectorizer(max_features=5000)  # make TF-IDF buat representasi kata
 
-        # Muat model sentimen jika ada
         self.load_sentiment_model()
         ################################
         self.load_model()
 
     def load_sentiment_model(self):
-        """Memuat model sentimen yang sudah dilatih sebelumnya."""
         if os.path.exists(self.sentiment_model_file):
             import pickle
             with open(self.sentiment_model_file, 'rb') as f:
@@ -79,24 +82,17 @@ class NeuralChat:
             logging.warning("Sentiment model file not found, model will not be available.")
 
     def train_sentiment_model(self, texts, labels):
-        """Melatih model sentimen menggunakan scikit-learn."""
-        # Menggunakan TF-IDF untuk mengubah teks menjadi vektor fitur
         X = self.vectorizer.fit_transform(texts)
         y = np.array(labels)
-
-        # Split data untuk pelatihan dan validasi
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        # Melatih model Logistic Regression
         sentiment_model = LogisticRegression(max_iter=1000)
         sentiment_model.fit(X_train, y_train)
 
-        # Evaluasi model
         y_pred = sentiment_model.predict(X_val)
         accuracy = accuracy_score(y_val, y_pred)
         logging.info(f"Sentiment model training completed with accuracy: {accuracy:.4f}")
 
-        # Simpan model sentiment ke file
         with open(self.sentiment_model_file, 'wb') as f:
             import pickle
             pickle.dump(sentiment_model, f)
@@ -105,7 +101,6 @@ class NeuralChat:
         self.sentiment_model = sentiment_model
 
     def predict_sentiment(self, text):
-        """Prediksi sentimen dari teks menggunakan model yang sudah dilatih."""
         if self.sentiment_model:
             X = self.vectorizer.transform([text])
             prediction = self.sentiment_model.predict(X)
@@ -113,44 +108,44 @@ class NeuralChat:
             return sentiment
         return "Sentiment model not available."
 
-    def train_with_embeddings(self, sentence):
+    def train_with_embeddings(self, sentence, freeze_vocab=True):
         tokens = word_tokenize(sentence.lower())
-        if not tokens:
-            return
+        if len(tokens) < 2:
+            return None, None
 
-        # Update vocabulary secara dinamis dengan batas vocab_size
-        for token in tokens:
-            if token not in self.word2idx:
-                if len(self.word2idx) < self.vocab_size:
+        filter_tokens = {'user', 'ai', 'user:', 'ai:', 'system'}
+        tokens = [t for t in tokens if t not in filter_tokens]
+
+        if not freeze_vocab:
+            for token in tokens:
+                if token not in self.word2idx and len(self.word2idx) < self.vocab_size:
                     idx = len(self.word2idx)
                     self.word2idx[token] = idx
                     self.idx2word[idx] = token
-                else:
-                    # Jika sudah melebihi batas, token akan dianggap <unk>
-                    continue
+            new_vocab_size = len(self.word2idx)
+            if new_vocab_size != self.vocab_size:
+                self.vocab_size = new_vocab_size
+                self.embedding_layer = nn.Embedding(self.vocab_size, self.embedding_dim)
+                self.linear_layer = nn.Linear(self.embedding_dim, self.embedding_dim)
 
-        # Konversi token ke indeks, token yang tidak ada akan mendapat indeks <unk>
-        indices = [self.word2idx.get(token, 0) for token in tokens]
-        indices_tensor = torch.tensor(indices, dtype=torch.long)
+        indices = [self.word2idx.get(t, 0) for t in tokens]
+        idx_tensor = torch.tensor(indices, dtype=torch.long)
 
-        # Dapatkan embedding dari embedding layer
-        embeddings = self.embedding_layer(indices_tensor)
-        embedding_matrix = embeddings.detach().numpy()
+        max_len = 128
+        if len(idx_tensor) > max_len:
+            idx_tensor = idx_tensor[:max_len]
 
-        # Proses embeddings melalui linear layer
+        embeddings = self.embedding_layer(idx_tensor)
         linear_output = self.linear_layer(embeddings)
 
-        # Lanjutkan update n-gram model menggunakan metode train yang sudah ada
-        self.train(sentence)
+        self.update_ngram_stats(" ".join(tokens))
 
-        return embedding_matrix, linear_output
+        return embeddings.detach().cpu().numpy(), linear_output.detach().cpu().numpy()
 
     def _serialize_counter(self, counter_obj):
-        """Serialisasi Counter ke dict."""
         return dict(counter_obj)
 
     def _serialize_ngram(self, ngram_dict):
-        """Serialize n-gram dictionary menggunakan delimiter aman."""
         serialized = {}
         for key, counter_obj in ngram_dict.items():
             key_str = "|||".join(key)
@@ -158,7 +153,6 @@ class NeuralChat:
         return serialized
 
     def _deserialize_ngram(self, data):
-        """Deserialize n-gram dictionary."""
         ngram = {}
         for key_str, value in data.items():
             key = tuple(key_str.split("|||"))
@@ -167,14 +161,10 @@ class NeuralChat:
 
     def softmax(self, logits):
         logits = np.array(logits) / self.softmax_temperature
-        exp_logits = np.exp(logits - np.max(logits))  # Prevent overflow
+        exp_logits = np.exp(logits - np.max(logits))
         return exp_logits / np.sum(exp_logits)
 
     def top_k_top_p_sampling(self, counter):
-        """
-        Lakukan sampling dengan teknik top-k dan nucleus (top-p).
-        Terapkan juga personality bias jika ada.
-        """
         biased_counter = {}
         for word, count in counter.items():
             bias = self.personality_bias.get(word, 1.0)
@@ -203,21 +193,13 @@ class NeuralChat:
         return chosen
 
     def determine_response_length(self, prompt_tokens):
-        """
-        Menentukan panjang respons berdasarkan token prompt dan context.
-        Jika ditemukan kata kunci seperti "long" atau "short", panjang respons akan disesuaikan.
-        Jika tidak, panjang respons diambil secara acak dalam rentang default.
-        """
-        # Set rentang default
         min_length, max_length = 35, 45
 
-        # Cek apakah ada petunjuk dari token prompt
         if any(token in prompt_tokens for token in ['long', 'detailed', 'extended']):
             min_length, max_length = 45, 60
         elif any(token in prompt_tokens for token in ['short', 'brief']):
             min_length, max_length = 25, 35
 
-        # Terapkan faktor pengali untuk panjang respons
         base_length = random.randint(min_length, max_length)
         desired_length = int(base_length * self.response_length_factor)
         return desired_length
@@ -228,31 +210,21 @@ class NeuralChat:
             return
         with self.lock:
             self.unigram.update(tokens)
-            # Bigram update
             for i in range(len(tokens) - 1):
                 self.bigram[tokens[i]].update([tokens[i + 1]])
-            # Trigram update
             for i in range(len(tokens) - 2):
                 key = (tokens[i], tokens[i + 1])
                 self.trigram[key].update([tokens[i + 2]])
                 self.total_trigrams += 1
-            # 4-gram update untuk konteks lebih panjang
             for i in range(len(tokens) - 3):
                 key = (tokens[i], tokens[i + 1], tokens[i + 2])
                 self.ngram4[key].update([tokens[i + 3]])
             self.record_counter += 1
-        if self.record_counter % 1000 == 0:
+        if self.record_counter % 2500 == 0:
             threading.Thread(target=self.safe_save).start()
 
     def generate_response(self, prompt_tokens):
-        """
-        Menghasilkan respons dengan mempertimbangkan konteks penuh dari prompt.
-        Alih-alih hanya menggunakan token terakhir, fungsi ini mencoba mencari
-        kecocokan n-gram dengan menggunakan 3, 2, atau 1 token terakhir dari prompt.
-        """
         response = []
-
-        # Coba gunakan n-gram terbesar yang mungkin dari prompt sebagai seed.
         seed_found = False
         for n in [3, 2, 1]:
             if len(prompt_tokens) >= n:
@@ -276,15 +248,11 @@ class NeuralChat:
                     seed_found = True
                     break
 
-        # Jika tidak ditemukan seed yang sesuai, gunakan token acak dari model.
         if not seed_found:
             seed = random.choice(list(self.unigram.keys()))
             response.append(seed)
-
-        # Tentukan panjang respons yang diinginkan berdasarkan prompt
         desired_length = self.determine_response_length(prompt_tokens)
 
-        # Hasilkan token berikutnya dengan menggunakan n-gram yang lebih tinggi bila memungkinkan
         while len(response) < desired_length:
             next_token = None
             if len(response) >= 3:
@@ -301,16 +269,29 @@ class NeuralChat:
                 break
             response.append(next_token)
         return " ".join(response)
+    
+    def update_ngram_stats(self, sentence):
+        tokens = word_tokenize(sentence.lower())
+        if not tokens:
+            return
+        with self.lock:
+            self.unigram.update(tokens)
+            for i in range(len(tokens) - 1):
+                self.bigram[tokens[i]].update([tokens[i + 1]])
+            for i in range(len(tokens) - 2):
+                key = (tokens[i], tokens[i + 1])
+                self.trigram[key].update([tokens[i + 2]])
+                self.total_trigrams += 1
+            for i in range(len(tokens) - 3):
+                key = (tokens[i], tokens[i + 1], tokens[i + 2])
+                self.ngram4[key].update([tokens[i + 3]])
+            self.record_counter += 1
+        if self.record_counter % 2500 == 0:
+            threading.Thread(target=self.safe_save).start()
 
     def update_history(self, user_message, ai_response):
-        """
-        Update riwayat percakapan dengan format:
-        User: <pesan>
-        AI: <respons>
-        """
         self.conversation_history.append(f"User: {user_message}")
         self.conversation_history.append(f"AI: {ai_response}")
-        # Jika riwayat terlalu panjang, batasi hanya token terakhir berdasarkan context_window
         combined = " ".join(self.conversation_history)
         tokens = word_tokenize(combined)
         if len(tokens) > self.context_window:
@@ -318,30 +299,19 @@ class NeuralChat:
             self.conversation_history = [" ".join(tokens)]
 
     def get_context_prompt(self):
-        """
-        Gabungkan riwayat percakapan menjadi satu prompt untuk konteks.
-        Pastikan seluruh riwayat percakapan dimasukkan dengan baik tanpa ada pemotongan.
-        """
         return " ".join(self.conversation_history)
 
     def chat(self, message):
-        """
-        Menggabungkan pesan terbaru dengan riwayat percakapan untuk digunakan sebagai prompt.
-        Model akan belajar dari pesan baru sekaligus menggunakan konteks sebelumnya.
-        """
-        sentiment = self.predict_sentiment(message)  # Prediksi sentimen pesan
+        #sentiment = self.predict_sentiment(message)
         context_prompt = self.get_context_prompt()
         full_prompt = f"{context_prompt} {message}" if context_prompt else message
-        self.train(full_prompt)
+        self.update_ngram_stats(full_prompt)
         tokens = word_tokenize(full_prompt.lower())
         response = self.generate_response(tokens)
         self.update_history(message, response)
         return response
 
     def test(self, user_input):
-        """
-        Dalam mode test, AI belajar dari input pengguna dan langsung memberikan respons.
-        """
         response = self.chat(user_input)
         print(f"AI: {response}")
 
@@ -397,56 +367,84 @@ class NeuralChat:
 
 def handle_interrupt(signal_received, frame, chatbot):
     global locker
-    """
-    Menyimpan model dengan aman sebelum keluar ketika terjadi interupsi.
-    """
     logging.info("Saving model before exiting...")
     chatbot.safe_save()
     locker = True
     logging.info("Model saved successfully!.")
     exit(0)
 
-def load_external_data():
+def build_vocab_from_dataset(dataset, model):
+    filter_tokens = {'user', 'ai', 'user:', 'ai:', 'system'}
+    for row in dataset:
+        text = row.get("text")
+        if not text:
+            continue
+        tokens = [t for t in word_tokenize(text.lower()) if t not in filter_tokens]
+        for token in tokens:
+            if token not in model.word2idx:
+                idx = len(model.word2idx)
+                model.word2idx[token] = idx
+                model.idx2word[idx] = token
+    model.vocab_size = len(model.word2idx)
+    model.embedding_layer = nn.Embedding(model.vocab_size, model.embedding_dim)
+    model.linear_layer = nn.Linear(model.embedding_dim, model.embedding_dim)
+
+def load_external_data(max_samples=100000, batch_size=8):
     from datasets import load_dataset
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     chatbot = NeuralChat()
     signal.signal(signal.SIGINT, lambda s, f: handle_interrupt(s, f, chatbot))
     try:
         dataset = load_dataset("OpenAssistant/oasst1", split="train")
-        # Batasi jumlah thread agar tidak membuat sistem overload
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            for idx, row in enumerate(dataset):
+        dataset = [row for row in dataset if row.get("text")]
+        if max_samples:
+            dataset = dataset[:max_samples]
+
+        build_vocab_from_dataset(dataset, chatbot)
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+            futures = {
+                executor.submit(chatbot.train_with_embeddings, row["text"]): idx
+                for idx, row in enumerate(dataset)
+            }
+            for i, future in enumerate(as_completed(futures)):
                 try:
-                    text_data = row.get("text", "")
-                    if text_data:
-                        # Pastikan args berupa tuple, dan submit task ke executor
-                        executor.submit(chatbot.train_with_embeddings, text_data)
+                    future.result()
+                    text = dataset[futures[future]]["text"]
+                    tokens = [t for t in word_tokenize(text.lower()) if t.isalpha()]
+                    token_ids = [chatbot.word2idx.get(t, 0) for t in tokens]
+
+                    if len(token_ids) > 2:
+                        max_len = 30
+                        padded = token_ids[:max_len] + [0] * max(0, max_len - len(token_ids))
+                        texts_for_sentiment.append(padded)
+                        labels_for_sentiment.append(1 if "good" in text.lower() else 0)
+
                 except Exception as inner_e:
-                    logging.warning(f"Skipping row {idx} due to error: {inner_e}")
+                    logging.warning(f"Error in sample {futures[future]}: {inner_e}")
                     continue
 
-                if idx % 1000 == 0 and idx > 0:
+                if i % 1000 == 0 and i > 0:
                     size_kb = os.path.getsize(chatbot.model_file) / 1024 if os.path.exists(chatbot.model_file) else 0
-                    print(f"Processed {idx} records, model size: {size_kb:.2f} KB", end='\r')
-                time.sleep(0.005)
+                    logging.info(f"Processed {i} records, model size: {size_kb:.2f} KB")
+                time.sleep(0.001)
+
     except Exception as e:
         logging.error(f"Failed to load dataset OpenAssistant: {str(e)}")
+    chatbot.train_sentiment_model(texts_for_sentiment, labels_for_sentiment)
     return chatbot
 
 def load_test_mode():
-    chatbot = NeuralChat()  # Buat satu instance
+    chatbot = NeuralChat()
     print("Entering chat mode. Type 'exit' to interrupt.")
     while True:
-        user_input = input("You: ")
+        user_input = clean_text(input("You: "))
         if user_input.lower() == "exit":
             break
-        response = chatbot.chat(user_input)  # Gunakan instance yang sama
+        response = clean_text(chatbot.chat(user_input))
         print(f"AI: {response}")
 
 def validate_training():
-    """
-    Validasi model dengan menguji beberapa input contoh.
-    """
     chatbot = NeuralChat()
     sample_inputs = ["hello", "hi", "how are you", "what's up", "good morning"]
     logging.info("Starting model validation..")
@@ -458,9 +456,6 @@ def validate_training():
         logging.info("Validation finished.")
 
 def main():
-    """
-    Program utama untuk memilih mode.
-    """
     mode = input("Choose mode (Train/Test/Validate): ").strip().lower()
     if mode == "train":
         chatbot = load_external_data()
